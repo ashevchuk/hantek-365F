@@ -47,7 +47,7 @@ Two independent tools are provided:
 
 *Real-time voltage chart with mode buttons, toolbar, and statistics bar.*
 
-### GUI — Compact Mode (toolbar only)
+### GUI — Compact Mode (toolbar and chart only)
 
 ![GUI compact](docs/screenshots/gui_compact.png)
 
