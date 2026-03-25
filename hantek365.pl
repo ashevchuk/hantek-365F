@@ -390,7 +390,7 @@ while ($running) {
         my $now = time();
         my $ms  = int(($now - int($now)) * 1000);
         my $ts  = strftime('%Y-%m-%d %H:%M:%S', localtime($now))
-                . ($opt_timestamp ? sprintf('.%03d', $ms) : '');
+                . ($opt_timestamp || $opt_csv ? sprintf('.%03d', $ms) : '');
 
         if ($opt_csv) {
             printf "%s,%s%s,%s,%s,%s\n",
