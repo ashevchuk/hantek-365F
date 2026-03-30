@@ -65,6 +65,7 @@ my $opt_verbose   = 0;
 my $opt_timestamp = 0;
 my $opt_csv       = 0;
 my $opt_interval  = 0;    # extra delay between readings (ms)
+my $opt_tui       = 0;    # TUI graph mode
 
 GetOptions(
     'port|p=s'     => \$opt_port,
@@ -74,6 +75,7 @@ GetOptions(
     'timestamp|t'  => \$opt_timestamp,
     'csv|c'        => \$opt_csv,
     'interval|i=i' => \$opt_interval,
+    'tui|g'        => \$opt_tui,
     'help|h'       => \&usage,
 ) or die "Try '$0 --help' for help.\n";
 
@@ -90,6 +92,7 @@ Options:
   -t, --timestamp       Prefix each reading with a timestamp
   -c, --csv             CSV output (timestamp,value,prefix,unit,flags)
   -i, --interval MS     Minimum interval between readings in ms (0 = as fast as possible)
+  -g, --tui             TUI graph mode: scrolling bar chart in the terminal
   -h, --help            Show this help
 
 Available modes (case-insensitive):
@@ -105,6 +108,7 @@ Examples:
   $prog -m ohm -c > data.csv      # Resistance in CSV-output
   $prog -m temp --interval 1000   # Temperature once per second
   $prog -p /dev/ttyACM1 -m VAC -v # Use different port with verbose output
+  $prog -m VDC --tui              # DC voltage as scrolling graph
 
 USAGE
     exit 0;
@@ -148,6 +152,143 @@ $| = 1;
 my $running = 1;
 $SIG{INT}  = sub { print STDERR "\nSIGINT received, stopping...\n"; $running = 0 };
 $SIG{TERM} = sub { print STDERR "\nSIGTERM received, stopping...\n"; $running = 0 };
+
+# ─── TUI mode ────────────────────────────────────────────────────────────────
+my @BLOCKS = (
+    ' ',
+    "\xe2\x96\x81",  # ▁ lower one-eighth block
+    "\xe2\x96\x82",  # ▂
+    "\xe2\x96\x83",  # ▃
+    "\xe2\x96\x84",  # ▄
+    "\xe2\x96\x85",  # ▅
+    "\xe2\x96\x86",  # ▆
+    "\xe2\x96\x87",  # ▇
+    "\xe2\x96\x88",  # █ full block
+);
+use constant TUI_LABEL_W => 10;  # columns reserved for y-axis labels + │ separator
+
+my @tui_buf         = ();
+my $tui_min         = undef;
+my $tui_max         = undef;
+my $tui_initialized = 0;
+
+# Get terminal dimensions via TIOCGWINSZ ioctl (Linux).
+sub get_term_size {
+    my $ws = "\0" x 8;
+    if (ioctl(STDOUT, 0x5413, $ws)) {
+        my ($rows, $cols) = unpack('S2', $ws);
+        return ($cols > 4 ? $cols : 80, $rows > 4 ? $rows : 24);
+    }
+    return (80, 24);
+}
+
+sub tui_render {
+    my ($p, $ts) = @_;
+
+    # Extract numeric value in base units (apply prefix multiplier so that
+    # switching ranges, e.g. V → mV, does not distort the graph scale).
+    (my $numstr = $p->{value}) =~ s/[^0-9.]//g;
+    return unless length($numstr);
+
+    my %PFX_MULT = (
+        "\xc2\xb5" => 1e-6,   # µ (micro)
+        'n'        => 1e-9,   # nano
+        'm'        => 1e-3,   # milli
+        ''         => 1,
+        'k'        => 1e3,    # kilo
+        'M'        => 1e6,    # Mega
+    );
+    my $mult = $PFX_MULT{$p->{prefix}} // 1;
+
+    my $val = ($numstr + 0) * $mult;
+    $val = -$val if $p->{sign} eq '-';
+
+    push @tui_buf, $val;
+    $tui_min = $val if !defined $tui_min || $val < $tui_min;
+    $tui_max = $val if !defined $tui_max || $val > $tui_max;
+
+    my ($cols, $rows) = get_term_size();
+    my $bar_w = $cols - TUI_LABEL_W;
+    $bar_w = 1 if $bar_w < 1;
+
+    # Keep rolling buffer at most $bar_w entries
+    splice @tui_buf, 0, @tui_buf - $bar_w if @tui_buf > $bar_w;
+
+    my $graph_rows = $rows - 4;   # 3 header lines + 1 x-axis line
+    $graph_rows = 2 if $graph_rows < 2;
+
+    # First call: clear screen and hide cursor
+    if (!$tui_initialized) {
+        print "\033[2J\033[?25l";
+        $tui_initialized = 1;
+    }
+    print "\033[H";   # move cursor to top-left
+
+    # ── Line 1: current reading ────────────────────────────────────────────────
+    my $reading = sprintf '%s%s %s%s  %s',
+        $p->{sign}, $p->{value}, $p->{prefix}, $p->{unit}, $p->{flags};
+    printf "\033[1m  %-*s\033[0m\n", $cols - 2, $reading;
+
+    # ── Line 2: timestamp + min/max stats (values in base units) ─────────────
+    printf "\033[2m  %s   Min:%-10s Max:%-10s %s\033[0m\n",
+        $ts,
+        sprintf('%.5g', $tui_min),
+        sprintf('%.5g', $tui_max),
+        $p->{unit};
+
+    # ── Line 3: separator ──────────────────────────────────────────────────────
+    print "\033[2m" . ("\xe2\x94\x80" x $cols) . "\033[0m\n";  # ─ × cols
+
+    # ── Graph ──────────────────────────────────────────────────────────────────
+    my $range = $tui_max - $tui_min;
+
+    # canvas[row][col] — one character per terminal cell
+    my @canvas = map { [(' ') x $bar_w] } 0 .. $graph_rows - 1;
+
+    my $n = scalar @tui_buf;
+    for my $i (0 .. $n - 1) {
+        my $col = $bar_w - $n + $i;
+        next if $col < 0;
+
+        my $frac = $range == 0
+            ? 0.5
+            : ($tui_buf[$i] - $tui_min) / $range;
+        $frac = 0 if $frac < 0;
+        $frac = 1 if $frac > 1;
+
+        # Total fill in eighths of a row, then split into full rows + partial
+        my $total8 = int($frac * $graph_rows * 8 + 0.5);
+        my $nfull  = int($total8 / 8);
+        my $npart  = $total8 % 8;
+
+        # Fill full rows from bottom up
+        for my $r (1 .. $nfull) {
+            my $row = $graph_rows - $r;
+            $canvas[$row][$col] = $BLOCKS[8] if $row >= 0;
+        }
+        # Partial block one row above the full ones
+        if ($npart && $nfull < $graph_rows) {
+            my $row = $graph_rows - 1 - $nfull;
+            $canvas[$row][$col] = $BLOCKS[$npart] if $row >= 0;
+        }
+    }
+
+    # Print graph rows with y-axis labels on the left
+    for my $r (0 .. $graph_rows - 1) {
+        my $label = '';
+        if    ($r == 0)                    { $label = sprintf '%.4g', $tui_max }
+        elsif ($r == $graph_rows - 1)      { $label = sprintf '%.4g', $tui_min }
+        elsif ($r == int($graph_rows / 2)) { $label = sprintf '%.4g', ($tui_min + $tui_max) / 2 }
+        printf "\033[2m%9s\xe2\x94\x82\033[0m%s\n",  # │
+            $label, join('', @{$canvas[$r]});
+    }
+
+    # X-axis line
+    printf "\033[2m%9s\xe2\x94\x94%s\033[0m",        # └ + ─ × bar_w
+        '', "\xe2\x94\x80" x $bar_w;
+}
+
+END { print "\033[?25h\n" if $opt_tui }  # restore cursor on exit
 
 # ─── Low-level I/O ───────────────────────────────────────────────────────────
 
@@ -332,7 +473,7 @@ if ($opt_csv) {
 }
 
 # ─── Main reading loop ───────────────────────────────────────────────────────
-print STDERR "Reading measurements. Press Ctrl+C to stop.\n";
+print STDERR "Reading measurements. Press Ctrl+C to stop.\n" unless $opt_tui;
 
 my $next_read = time();
 
@@ -390,9 +531,11 @@ while ($running) {
         my $now = time();
         my $ms  = int(($now - int($now)) * 1000);
         my $ts  = strftime('%Y-%m-%d %H:%M:%S', localtime($now))
-                . ($opt_timestamp || $opt_csv ? sprintf('.%03d', $ms) : '');
+                . ($opt_timestamp || $opt_csv || $opt_tui ? sprintf('.%03d', $ms) : '');
 
-        if ($opt_csv) {
+        if ($opt_tui) {
+            tui_render($p, $ts);
+        } elsif ($opt_csv) {
             printf "%s,%s%s,%s,%s,%s\n",
                 $ts,
                 $p->{sign} eq ' ' ? '' : $p->{sign},
